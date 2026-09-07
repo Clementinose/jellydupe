@@ -1,0 +1,13 @@
+services:
+  jellydupe:
+    image: ghcr.io/clements/jellydupe:latest
+    container_name: jellydupe
+    ports:
+      - "8095:8095"
+    volumes:
+      - /mnt/user/appdata/jellydupe:/config
+    environment:
+      # Valfritt — utan dessa frågar appen efter adress och nyckel vid första start.
+      - JELLYFIN_URL=http://192.168.1.10:8096
+      - JELLYFIN_API_KEY=
+    restart: unless-stopped
