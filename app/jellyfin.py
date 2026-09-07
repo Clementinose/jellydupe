@@ -1,4 +1,4 @@
-"""Jellyfin-klient + dubblettlogik för JellyDupe."""
+"""Jellyfin client + duplicate-detection logic for JellyDupe."""
 
 import re
 import unicodedata
@@ -11,6 +11,54 @@ TIMEOUT = 60
 
 MOVIE_FIELDS = "MediaSources,Path,ProviderIds,ProductionYear,DateCreated"
 EPISODE_FIELDS = "MediaSources,Path,ProviderIds,SeriesInfo,DateCreated"
+
+# Explicit SxxExx in the filename is unambiguous ground truth — Jellyfin
+# sometimes mis-tags episodes (whole batches collapsing to one episode
+# number) for unmatched/obscure anime releases, so this always wins.
+_SXXEXX_RE = re.compile(r'[Ss](\d{1,3})[Ee](\d{1,4})')
+# Loose "trailing episode number" pattern for raw scene releases with no
+# season/episode markup at all, e.g. "[Group] Show - 083.mkv".
+_EP_NUM_RE = re.compile(r'(?:^|[ ._\-])(?:e|ep|episode)?0*(\d{2,4})(?:v\d+)?(?:[ ._\-]|$)', re.IGNORECASE)
+
+
+def _filename_sxxexx(path: str) -> "tuple[Optional[int], Optional[int]]":
+    base = (path or "").rsplit("/", 1)[-1]
+    m = _SXXEXX_RE.search(base)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def _filename_episode_number(path: str) -> Optional[int]:
+    base = (path or "").rsplit("/", 1)[-1]
+    base = re.sub(r'\.\w{2,4}$', '', base)
+    matches = _EP_NUM_RE.findall(base)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def resolve_season_episode(path: str, jf_season: Optional[int], jf_number: Optional[int]):
+    """Figure out the real (season, episode) for a file, distrusting Jellyfin
+    when the filename itself disagrees or fills in a gap. Order of trust:
+    1. Explicit SxxExx in the filename — unambiguous, always wins.
+    2. A loose trailing episode number in the filename (common in raw scene/anime
+       releases with no season markup) combined with Jellyfin's season, if any.
+    3. Jellyfin's own parsed fields.
+    """
+    fs, fn = _filename_sxxexx(path)
+    if fs is not None and fn is not None:
+        return fs, fn
+
+    loose = _filename_episode_number(path)
+    if loose is not None:
+        season = jf_season if jf_season is not None else 1
+        return season, loose
+
+    return jf_season, jf_number
 
 
 class JellyfinError(Exception):
@@ -191,36 +239,50 @@ class Jellyfin:
         return self._finish(buckets)
 
     def scan_episodes(self, user_id: str, progress=None) -> List[Dict]:
-        buckets: Dict[str, Dict] = {}
+        # Group at the individual-file level, not the Jellyfin-item level.
+        # Jellyfin can misidentify obscure/unmatched anime and either (a)
+        # split one true episode across several separate items, or (b) merge
+        # several genuinely different episodes into one item's alternate
+        # versions. Deriving season/episode straight from each file's own
+        # path sidesteps both failure modes.
+        flat = []
         seen = 0
         for item in self._items(user_id, "Episode", EPISODE_FIELDS):
             seen += 1
             if progress and seen % 200 == 0:
-                progress(f"Läser avsnitt … {seen}")
+                progress(f"Reading episodes… {seen}")
 
-            series = item.get("SeriesId") or _norm(item.get("SeriesName", ""))
-            season = item.get("ParentIndexNumber")
-            number = item.get("IndexNumber")
-            if season is None or number is None:
-                # Utan säsong/avsnittsnummer går det inte att jämföra tryggt.
-                continue
+            series_id = item.get("SeriesId") or _norm(item.get("SeriesName", ""))
+            series_name = item.get("SeriesName") or "Unknown series"
+            jf_season = item.get("ParentIndexNumber")
+            jf_number = item.get("IndexNumber")
+            item_name = item.get("Name")
+            item_id = item.get("Id")
 
-            key = f"{series}:S{season:02d}E{number:02d}"
+            for v in self._versions(item):
+                season, number = resolve_season_episode(v["path"], jf_season, jf_number)
+                if season is None or number is None:
+                    continue
+                flat.append((series_id, series_name, season, number, item_id, item_name, v))
+
+        buckets: Dict[str, Dict] = {}
+        for series_id, series_name, season, number, item_id, item_name, v in flat:
+            key = f"{series_id}:S{season:02d}E{number:02d}"
             bucket = buckets.setdefault(
                 key,
                 {
                     "key": key,
                     "kind": "episode",
-                    "title": item.get("Name") or f"Avsnitt {number}",
-                    "series": item.get("SeriesName") or "Okänd serie",
+                    "title": item_name or f"Episode {number}",
+                    "series": series_name,
                     "season": season,
                     "episode": number,
-                    "subtitle": f"{item.get('SeriesName') or ''} · S{season:02d}E{number:02d}",
-                    "poster": item.get("Id"),
+                    "subtitle": f"{series_name} · S{season:02d}E{number:02d}",
+                    "poster": item_id,
                     "versions": [],
                 },
             )
-            bucket["versions"].extend(self._versions(item))
+            bucket["versions"].append(v)
 
         return self._finish(buckets)
 
